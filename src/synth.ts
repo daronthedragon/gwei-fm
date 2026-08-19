@@ -115,6 +115,12 @@ function renderEvent(ev: NoteEvent, left: Float32Array, right: Float32Array, noi
   const gl = Math.cos(angle)
   const gr = Math.sin(angle)
   const c = ev.colour
+  // The per-note fingerprint. Centred so 0.5 is the family's home sound and
+  // the spread stays musical: siblings, never clones.
+  const v = ev.variant ?? 0.5
+  const spread = (v - 0.5) * 2 // -1..1
+  const detune = 1 + spread * 0.006
+  const decayScale = 1 + spread * 0.35
 
   // Per-note filter state.
   let filter: OnePole | null = null
@@ -137,7 +143,7 @@ function renderEvent(ev: NoteEvent, left: Float32Array, right: Float32Array, noi
 
   for (let i = 0; i < count; i++) {
     const t = i / SAMPLE_RATE
-    const amp = envelope(env, t, ev.length) * ev.velocity
+    const amp = envelope({ ...env, decay: env.decay * decayScale }, t, ev.length) * ev.velocity
     if (amp <= 0) continue
 
     const phase = 2 * Math.PI * ev.frequency * t
@@ -145,18 +151,19 @@ function renderEvent(ev: NoteEvent, left: Float32Array, right: Float32Array, noi
 
     switch (ev.instrument) {
       // ---- leads ----
-      case 'saw-lead': s = saw(phase, 12) * 0.55 + saw(phase * 1.004, 12) * 0.45; break
-      case 'sine-lead': s = Math.sin(phase) * 0.85 + Math.sin(2 * phase) * 0.15 * c; break
-      case 'square-lead': s = square(phase, 9) * 0.7 + square(phase * 1.006, 9) * 0.3; break
+      case 'saw-lead': s = saw(phase, 12) * 0.55 + saw(phase * detune * 1.003, 12) * 0.45; break
+      case 'sine-lead': s = Math.sin(phase) * (0.75 + 0.15 * v) + Math.sin(2 * phase) * (0.1 + 0.12 * c) + Math.sin(3 * phase) * 0.1 * v; break
+      case 'square-lead': s = square(phase, 7 + Math.round(v * 4)) * 0.7 + square(phase * detune * 1.002, 9) * 0.3; break
       case 'fm-bell': {
         // 2-op FM, ratio 3.5:1, index decays. Colour sets the index.
-        const index = (1.5 + 4 * c) * Math.exp(-t * 3)
-        s = Math.sin(phase + index * Math.sin(phase * 3.5))
+        const ratio = 2.5 + v * 2.5 // each bell is its own bell
+        const index = (1.5 + 4 * c) * Math.exp(-t * (2 + v * 3))
+        s = Math.sin(phase + index * Math.sin(phase * ratio))
         break
       }
       case 'pluck': {
         // Bright start that darkens: square blended toward sine over time.
-        const bright = Math.exp(-t * 18)
+        const bright = Math.exp(-t * (12 + v * 14))
         s = square(phase, 7) * bright * 0.5 + Math.sin(phase) * (1 - bright * 0.5)
         break
       }
@@ -184,28 +191,28 @@ function renderEvent(ev: NoteEvent, left: Float32Array, right: Float32Array, noi
       case 'acid-bass': {
         // The 303 move: saw through a resonant filter whose cutoff sweeps
         // down over the note, starting higher when the colour is hot.
-        const cutoff = (250 + 2600 * c) * Math.exp(-t * 10) + 120
-        s = (resonant as Resonant).step(saw(phase, 16), cutoff, 0.35)
+        const cutoff = (250 + 2600 * c) * Math.exp(-t * (7 + v * 7)) + 120
+        s = (resonant as Resonant).step(saw(phase, 16), cutoff, 0.25 + v * 0.25)
         break
       }
       case 'pluck-bass': s = Math.sin(phase) * 0.7 + saw(phase, 5) * 0.3 * Math.exp(-t * 12); break
       // ---- drums ----
       case 'kick-soft': {
-        const sweep = ev.frequency + 90 * Math.exp(-t * 40)
+        const sweep = ev.frequency * (0.92 + 0.16 * v) + 90 * Math.exp(-t * 40)
         s = Math.sin(2 * Math.PI * sweep * t)
         break
       }
       case 'kick-hard': {
-        const sweep = ev.frequency + 160 * Math.exp(-t * 45)
+        const sweep = ev.frequency * (0.92 + 0.16 * v) + 160 * Math.exp(-t * 45)
         s = Math.sin(2 * Math.PI * sweep * t) * 0.9 + (t < 0.005 ? (noise() * 2 - 1) * 0.6 : 0)
         break
       }
       case 'kick-808': {
-        const sweep = ev.frequency * 0.9 + 60 * Math.exp(-t * 25)
+        const sweep = ev.frequency * (0.85 + 0.1 * v) + 60 * Math.exp(-t * 25)
         s = Math.tanh(Math.sin(2 * Math.PI * sweep * t) * 1.6)
         break
       }
-      case 'snare-tight': s = Math.sin(phase) * Math.exp(-t * 35) * 0.45 + (noise() * 2 - 1) * 0.65; break
+      case 'snare-tight': s = Math.sin(phase * (0.9 + 0.2 * v)) * Math.exp(-t * 35) * 0.45 + (noise() * 2 - 1) * 0.65; break
       case 'snare-clap': {
         // Three quick noise bursts then a tail.
         const burst = t < 0.03 ? 1 : t < 0.04 ? 0.2 : t < 0.06 ? 0.9 : t < 0.07 ? 0.2 : t < 0.09 ? 0.8 : 0.5
@@ -225,9 +232,9 @@ function renderEvent(ev: NoteEvent, left: Float32Array, right: Float32Array, noi
 
     if (filter) s = filter.step(s)
 
-    const v = s * amp
-    left[start + i] = (left[start + i] as number) + v * gl
-    right[start + i] = (right[start + i] as number) + v * gr
+    const out = s * amp
+    left[start + i] = (left[start + i] as number) + out * gl
+    right[start + i] = (right[start + i] as number) + out * gr
   }
 }
 

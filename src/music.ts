@@ -1,4 +1,4 @@
-import type { BlockNote } from './chain.js'
+import type { BlockNote, TxKind, TxNote } from './chain.js'
 import { CADENCES, MODES, deriveStyle, type Instrument, type Style } from './style.js'
 
 /**
@@ -34,10 +34,16 @@ export interface NoteEvent {
   pan: number
   /** 0..1, instrument-specific colour (filter cutoff, FM depth, etc). */
   colour: number
+  /**
+   * 0..1 timbre seed. For transaction notes this comes from the tx hash, so
+   * no two notes are ever the identical sound. Structural voices derive it
+   * from the block's RANDAO.
+   */
+  variant: number
   blockNumber: number
 }
 
-export type Role = 'lead' | 'arp' | 'pad' | 'bass' | 'sub' | 'kick' | 'snare' | 'hat' | 'accent'
+export type Role = 'lead' | 'tx' | 'pad' | 'bass' | 'sub' | 'kick' | 'snare' | 'hat' | 'accent'
 
 const DEGREE_NAMES = ['i', 'ii', 'iii', 'iv', 'v', 'vi', 'vii']
 
@@ -72,6 +78,46 @@ const median = (values: number[]): number => {
 
 /** Bars per harmonic section. */
 const BARS_PER_SECTION = 2
+
+/**
+ * What each kind of transaction sounds like. This is fixed across every
+ * piece on purpose: a swap is always the acid family, a plain send is always
+ * a pluck, a deploy is always the big bell. Learn the vocabulary once and
+ * you can hear what a block was doing in any render. The style then chooses
+ * the register and the room, and the tx hash makes each note one of a kind.
+ */
+const KIND_INSTRUMENT: Record<TxKind, Instrument> = {
+  swap: 'acid-bass',
+  transfer: 'pluck',
+  token: 'sine-lead',
+  deploy: 'fm-bell',
+  blob: 'sub-bass',
+  setCode: 'snare-noise',
+  other: 'square-lead',
+}
+
+/** How loud a transaction is: ETH moved, or requested work for value-less calls. */
+function salienceVelocity(t: TxNote): number {
+  if (t.valueEth > 0) {
+    // log scale: 0.01 ETH ~ 0.25, 1 ETH ~ 0.45, 100 ETH ~ 0.65
+    return Math.max(0.15, Math.min(0.7, 0.45 + 0.1 * Math.log10(Math.max(1e-4, t.valueEth))))
+  }
+  return Math.max(0.12, Math.min(0.5, 0.1 + 0.08 * Math.log10(t.gasLimit)))
+}
+
+/**
+ * Pitch of a transaction: its value on a log scale, snapped to the current
+ * chord so the block's traffic plays the harmony. Small sends sit low,
+ * whale moves ring high. Value-less calls pitch by requested gas instead.
+ */
+function txDegree(t: TxNote, chordTones: number[], variant: number): number {
+  const magnitude = t.valueEth > 0
+    ? Math.max(0, Math.min(1, (Math.log10(Math.max(1e-4, t.valueEth)) + 4) / 7))
+    : Math.max(0, Math.min(1, (Math.log10(t.gasLimit) - 4.3) / 2.5))
+  const octave = Math.floor(magnitude * 3) * 7 // three octaves of room
+  const tone = chordTones[Math.floor(variant * chordTones.length) % chordTones.length] as number
+  return tone + 7 + octave
+}
 
 export interface ComposeOptions {
   /** Override the chain-derived style, for tests. */
@@ -132,14 +178,6 @@ export function compose(blocks: BlockNote[], opts: ComposeOptions = {}): Score {
   const swung = (base: number, beat: number, sub: number, of: number) =>
     base + (beat * sub) / of + (sub % 2 === 1 ? beat * style.swing * (1 / of) : 0)
 
-  // ---- Motif --------------------------------------------------------------
-  // A short melodic cell is derived from the seed once, then the lead plays
-  // it, transposes it, inverts it as intensity changes. Real melodies repeat.
-  const motifRng = seedRng(style.seed)
-  const motif = Array.from({ length: 4 }, () => Math.floor(motifRng() * 5) - 2) // steps in -2..2
-  let leadDegree = 7
-  let lastLeadAt = -Infinity
-  let motifPos = 0
 
   for (let i = 0; i < blocks.length; i++) {
     const b = blocks[i] as BlockNote
@@ -149,6 +187,8 @@ export function compose(blocks: BlockNote[], opts: ComposeOptions = {}): Score {
     const beatInBar = i % BAR
     const sectionStart = i % SECTION === 0
     const colour = share(b)
+    // Structural voices vary per block too: seeded by this block's RANDAO.
+    const blockVariant = hashTo01(b.mixHash)
 
     // Arrangement tiers scaled by the style's busyness: a swap-heavy range
     // brings drums in sooner, a rollup range holds them back.
@@ -174,7 +214,7 @@ export function compose(blocks: BlockNote[], opts: ComposeOptions = {}): Score {
           at: clock, length: beat * SECTION,
           frequency: midiToHz(degreeToMidi(root - 12, mode, chordTones[t % chordTones.length] as number)),
           velocity: 0.07 + 0.16 * inten, instrument: style.pad, role: 'pad',
-          pan: (t - 1) * 0.55, colour: inten, blockNumber: b.number,
+          pan: (t - 1) * 0.55, colour: inten, variant: blockVariant, blockNumber: b.number,
         })
       }
 
@@ -184,7 +224,7 @@ export function compose(blocks: BlockNote[], opts: ComposeOptions = {}): Score {
           at: clock, length: beat * SECTION,
           frequency: midiToHz(degreeToMidi(root - 36, mode, chordDegree)),
           velocity: 0.1 + 0.2 * sectionBlobs, instrument: 'sub-bass', role: 'sub',
-          pan: 0, colour: sectionBlobs, blockNumber: b.number,
+          pan: 0, colour: sectionBlobs, variant: blockVariant, blockNumber: b.number,
         })
       }
     }
@@ -196,22 +236,9 @@ export function compose(blocks: BlockNote[], opts: ComposeOptions = {}): Score {
         at: clock, length: beat * (beatInBar === 0 ? 1.6 : 0.7),
         frequency: midiToHz(degreeToMidi(root - 24, mode, chordDegree) + up),
         velocity: 0.3 + 0.45 * inten, instrument: style.bass, role: 'bass',
-        pan: 0, colour: fast, blockNumber: b.number,
+        pan: 0, colour: fast, variant: blockVariant, blockNumber: b.number,
       })
     }
-    // Acid bass gets the sixteenth-note pattern when the block is swap-heavy:
-    // the DEX traffic literally drives the bassline.
-    if (style.bass === 'acid-bass' && fullKit && colour.swaps > 0.15) {
-      for (let s = 1; s < 4; s++) {
-        events.push({
-          at: swung(clock, beat, s, 4), length: beat * 0.18,
-          frequency: midiToHz(degreeToMidi(root - 24, mode, chordDegree + (s === 2 ? 4 : 0))),
-          velocity: 0.25 + 0.3 * colour.swaps, instrument: 'acid-bass', role: 'bass',
-          pan: 0, colour: 0.5 + 0.5 * colour.swaps, blockNumber: b.number,
-        })
-      }
-    }
-
     // ---- Drums ------------------------------------------------------------
     const downbeats = BAR === 3 ? [0] : BAR === 5 ? [0, 3] : BAR === 7 ? [0, 3, 5] : BAR === 6 ? [0, 3] : [0, Math.floor(BAR / 2)]
     const backbeats = BAR === 3 ? [2] : BAR === 5 ? [2, 4] : BAR === 7 ? [2, 4, 6] : BAR === 6 ? [2, 5] : [1, 3]
@@ -220,102 +247,74 @@ export function compose(blocks: BlockNote[], opts: ComposeOptions = {}): Score {
       events.push({
         at: clock, length: 0.22, frequency: 52,
         velocity: (drumsIn ? 0.55 : 0.3) + 0.4 * fullRank(b.fullness),
-        instrument: style.kick, role: 'kick', pan: 0, colour: fullRank(b.fullness), blockNumber: b.number,
+        instrument: style.kick, role: 'kick', pan: 0, colour: fullRank(b.fullness),
+        variant: blockVariant, blockNumber: b.number,
       })
     }
     if (drumsIn && backbeats.includes(beatInBar)) {
       events.push({
         at: clock, length: 0.2, frequency: 190, velocity: 0.3 + 0.4 * fast,
-        instrument: style.snare, role: 'snare', pan: 0.08, colour: fast, blockNumber: b.number,
+        instrument: style.snare, role: 'snare', pan: 0.08, colour: fast,
+        variant: blockVariant, blockNumber: b.number,
       })
     }
     if (fullKit && beatInBar === BAR - 1 && fast > 0.55) {
       events.push({
         at: clock + beat * 0.5, length: 0.12, frequency: 190, velocity: 0.2,
-        instrument: style.snare, role: 'snare', pan: -0.12, colour: 0.3, blockNumber: b.number,
+        instrument: style.snare, role: 'snare', pan: -0.12, colour: 0.3,
+        variant: blockVariant, blockNumber: b.number,
       })
     }
     const density = txRank(b.txCount)
     const subdiv = !drumsIn ? 0 : density > 0.66 ? 4 : density > 0.33 ? 2 : 1
-    for (let s = 0; s < subdiv; s++) {
-      const off = s % 2 === 1
+    for (let sd = 0; sd < subdiv; sd++) {
+      const off = sd % 2 === 1
       events.push({
-        at: swung(clock, beat, s, subdiv), length: off ? 0.04 : 0.07, frequency: 0,
+        at: swung(clock, beat, sd, subdiv), length: off ? 0.04 : 0.07, frequency: 0,
         velocity: (off ? 0.07 : 0.15) + 0.1 * fast,
         instrument: off && style.hat === 'hat-closed' && fast > 0.7 ? 'hat-open' : style.hat,
-        role: 'hat', pan: off ? 0.4 : -0.25, colour: density, blockNumber: b.number,
+        role: 'hat', pan: off ? 0.4 : -0.25, colour: density,
+        variant: blockVariant, blockNumber: b.number,
       })
     }
 
-    // ---- Accents from what the block did ----------------------------------
-    // A contract deployment is a bell: something new exists. A set-code tx is
-    // a glitch. These are rare, so they stay special.
-    if (b.tx.creates > 0) {
-      events.push({
-        at: clock, length: beat * 2,
-        frequency: midiToHz(degreeToMidi(root + 12, mode, chordTones[0] as number)),
-        velocity: 0.22 + 0.1 * Math.min(3, b.tx.creates), instrument: 'fm-bell', role: 'accent',
-        pan: 0.6, colour: 0.8, blockNumber: b.number,
-      })
-    }
-    if (b.tx.setCode > 0 && fullKit) {
-      events.push({
-        at: clock + beat * 0.25, length: 0.06, frequency: 0, velocity: 0.18,
-        instrument: 'snare-noise', role: 'accent', pan: -0.6, colour: 1, blockNumber: b.number,
-      })
-    }
+    // ---- The transactions themselves --------------------------------------
+    // Every pitched foreground note IS a transaction. Pitch is its value on
+    // a log scale snapped to the current chord; where it lands in the beat is
+    // where it sat in the block; its kind decides the instrument family; its
+    // hash makes the exact timbre one of a kind. The biggest transaction of
+    // the block is the lead voice, held longer and brighter; the rest are
+    // the texture behind it.
+    const audibleTxs = drumsIn ? b.notable : b.notable.slice(0, 2)
+    let leadDone = false
+    for (const t of audibleTxs) {
+      const isLead = !leadDone && (t.valueEth > 0 || t.kind === 'deploy')
+      const degree = txDegree(t, chordTones, t.variant)
+      const at = isLead ? clock : swung(clock, beat, Math.round(t.position * 7), 8)
+      const baseVelocity = salienceVelocity(t)
+      const velocity = isLead
+        ? baseVelocity * (0.7 + 0.5 * inten)
+        : baseVelocity * (0.35 + 0.4 * fast)
+      const length = isLead
+        ? beat * (0.6 + style.legato * fullRank(b.fullness))
+        : t.kind === 'deploy' ? beat * 2 : beat * 0.22
 
-    // ---- Arp --------------------------------------------------------------
-    // Token traffic drives the arp: a block shuffling ERC-20s is a block that
-    // sparkles. Only with the full kit, faded in by intensity.
-    if (fullKit && (fast > 0.45 || colour.tokens > 0.3)) {
-      const steps = 4
-      const gain = Math.max(0, (fast - 0.45) / 0.55) * 0.6 + colour.tokens * 0.4
-      for (let s = 0; s < steps; s++) {
-        const tone = chordTones[(i + s) % chordTones.length] as number
-        events.push({
-          at: swung(clock, beat, s, steps), length: (beat / steps) * 0.8,
-          frequency: midiToHz(degreeToMidi(root, mode, tone + 7)),
-          velocity: (0.1 + 0.2 * gain) * (s % 2 === 0 ? 1 : 0.7),
-          // The arp borrows the lead's character so the layers agree.
-          instrument: style.lead === 'saw-lead' || style.lead === 'square-lead' ? 'square-lead' : style.lead === 'fm-bell' ? 'fm-bell' : 'pluck',
-          role: 'arp',
-          pan: Math.sin(i + s) * 0.6, colour: gain, blockNumber: b.number,
-        })
-      }
-    }
-
-    // ---- Lead -------------------------------------------------------------
-    // The melody plays a motif, stepping toward where the fee points. Fee
-    // sets the register; the motif sets the shape; fullness decides whether
-    // this beat gets a note at all.
-    const target = Math.round(5 + feeRank(b.baseFeeGwei) * 7 * style.melodicRange)
-    const wantsToPlay = fullRank(b.fullness) > 0.35 || beatInBar === 0
-    if (wantsToPlay && clock - lastLeadAt >= beat * 0.9) {
-      // Motif step, then drift toward the target so the line has direction.
-      const drift = Math.sign(target - leadDegree)
-      const step = (motif[motifPos % motif.length] as number) + (Math.abs(target - leadDegree) > 3 ? drift : 0)
-      leadDegree += Math.max(-3, Math.min(3, step))
-      motifPos++
-      if (beatInBar === 0) {
-        const candidates = chordTones.map((t) => t + 7)
-        const nearest = candidates.reduce((best, c) => (Math.abs(c - leadDegree) < Math.abs(best - leadDegree) ? c : best), candidates[0] as number)
-        if (Math.abs(nearest - leadDegree) <= 1) leadDegree = nearest
-      }
-      // Keep the melody in a sane register.
-      // The ceiling must be an integer: a fractional degree indexes off the
-      // end of the mode array and the note comes out NaN.
-      leadDegree = Math.max(3, Math.min(Math.round(5 + 7 * style.melodicRange + 4), leadDegree))
-      const hold = beatInBar === 0 ? beat * 1.8 : beat * (0.3 + style.legato * fullRank(b.fullness))
       events.push({
-        at: clock, length: hold,
-        frequency: midiToHz(degreeToMidi(root, mode, leadDegree)),
-        velocity: 0.2 + 0.5 * fullRank(b.fullness) * (0.4 + 0.6 * inten),
-        instrument: style.lead, role: 'lead', pan: 0.15,
-        // Brightness follows fullness: a full block is a bright note.
-        colour: 0.3 + 0.7 * fullRank(b.fullness), blockNumber: b.number,
+        at,
+        length,
+        // setCode is unpitched: a glitch, not a note.
+        frequency: t.kind === 'setCode' ? 0 : midiToHz(degreeToMidi(root, mode, degree)),
+        velocity,
+        // The lead borrows the style's voice so each piece keeps its own
+        // colour; the texture speaks the fixed kind-vocabulary.
+        instrument: isLead && t.kind !== 'deploy' && t.kind !== 'setCode' ? style.lead : KIND_INSTRUMENT[t.kind],
+        role: isLead ? 'lead' : 'tx',
+        pan: (t.position - 0.5) * 1.2,
+        colour: 0.3 + 0.7 * fullRank(b.fullness),
+        variant: t.variant,
+        blockNumber: b.number,
       })
-      lastLeadAt = clock
+      if (isLead) leadDone = true
     }
 
     clock += beat
@@ -327,15 +326,11 @@ export function compose(blocks: BlockNote[], opts: ComposeOptions = {}): Score {
   return { events, duration: clock + 3, style, sections }
 }
 
-function seedRng(seedHex: string): () => number {
+function hashTo01(hex: string): number {
   let h = 2166136261
-  for (let i = 2; i < seedHex.length; i++) {
-    h ^= seedHex.charCodeAt(i)
+  for (let i = 2; i < Math.min(hex.length, 34); i++) {
+    h ^= hex.charCodeAt(i)
     h = Math.imul(h, 16777619)
   }
-  let state = (h ^ 0x9e3779b9) >>> 0 || 1
-  return () => {
-    state = (Math.imul(state, 1664525) + 1013904223) >>> 0
-    return state / 0x1_0000_0000
-  }
+  return (h >>> 0) / 0x1_0000_0000
 }

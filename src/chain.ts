@@ -19,6 +19,28 @@ export interface BlockNote {
   builderTag: string
   /** Transaction character of the block. */
   tx: TxMix
+  /**
+   * The block's most salient transactions, each of which becomes a note.
+   * Bounded and deterministically chosen, so a 1500-tx block still renders.
+   */
+  notable: TxNote[]
+}
+
+export type TxKind = 'swap' | 'transfer' | 'token' | 'deploy' | 'blob' | 'setCode' | 'other'
+
+export interface TxNote {
+  kind: TxKind
+  /** ETH moved. Zero for most contract calls. */
+  valueEth: number
+  /** Gas limit: how much work the sender expected. Salience for 0-value calls. */
+  gasLimit: number
+  /** Position in the block, 0..1. Where in the beat the note lands. */
+  position: number
+  /**
+   * Per-note timbre seed from the tx hash, 0..1. No two transactions share
+   * one, so no two notes are the same sound.
+   */
+  variant: number
 }
 
 export interface TxMix {
@@ -45,9 +67,12 @@ export const PUBLIC_RPCS = [
 ] as const
 
 interface RawTx {
+  hash?: string
   type?: string
   to?: string | null
   input?: string
+  value?: string
+  gas?: string
 }
 
 interface RawBlock {
@@ -90,6 +115,70 @@ function classify(txs: RawTx[]): TxMix {
     else mix.other++
   }
   return mix
+}
+
+/** 0..1 from a tx hash, deterministic. */
+function hashVariant(hash: string | undefined): number {
+  if (!hash) return 0.5
+  let h = 2166136261
+  for (let i = 2; i < Math.min(hash.length, 34); i++) {
+    h ^= hash.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return (h >>> 0) / 0x1_0000_0000
+}
+
+function kindOf(t: RawTx): TxKind {
+  const input = t.input ?? '0x'
+  const selector = input.slice(0, 10)
+  if (t.type === '0x3') return 'blob'
+  if (t.type === '0x4') return 'setCode'
+  if (t.to === null || t.to === undefined) return 'deploy'
+  if (input.length <= 2) return 'transfer'
+  if (selector === TRANSFER_SELECTOR) return 'token'
+  if (SWAP_SELECTORS.has(selector)) return 'swap'
+  return 'other'
+}
+
+/**
+ * The transactions worth a note. Deploys and set-code always make the cut
+ * (they are rare and mean something happened); the rest rank by salience:
+ * ETH moved, or for value-less contract calls, how much work was requested.
+ */
+function notableTxs(txs: RawTx[], cap = 6): TxNote[] {
+  const scored = txs.map((t, index) => {
+    const kind = kindOf(t)
+    const valueEth = t.value ? Number(BigInt(t.value)) / 1e18 : 0
+    const gasLimit = t.gas ? Number(BigInt(t.gas)) : 21_000
+    // Only deployments are unconditionally in: they are rare and mean
+    // something shipped. setCode ranks normally (7702 batches arrive in
+    // spam quantities) and is capped below so it stays a seasoning.
+    const salience = kind === 'deploy' ? Number.MAX_SAFE_INTEGER : valueEth * 1e6 + gasLimit / 1e3
+    return {
+      salience,
+      note: {
+        kind,
+        valueEth,
+        gasLimit,
+        position: txs.length > 1 ? index / (txs.length - 1) : 0,
+        variant: hashVariant(t.hash),
+      } as TxNote,
+    }
+  })
+  scored.sort((a, b) => b.salience - a.salience)
+  // At most two notes of any one kind per block, and one setCode: variety
+  // in the block should be variety in the beat, not one kind repeated.
+  const perKind = new Map<TxKind, number>()
+  const picked: TxNote[] = []
+  for (const { note } of scored) {
+    const limit = note.kind === 'setCode' ? 1 : 2
+    const used = perKind.get(note.kind) ?? 0
+    if (used >= limit) continue
+    perKind.set(note.kind, used + 1)
+    picked.push(note)
+    if (picked.length >= cap) break
+  }
+  return picked.sort((a, b) => a.position - b.position)
 }
 
 /** Printable ASCII from extraData, or empty. Builders sign their blocks here. */
@@ -212,6 +301,7 @@ export async function fetchBlocks(
     mixHash: b.mixHash,
     builderTag: builderTag(b.extraData),
     tx: classify(b.transactions),
+    notable: notableTxs(b.transactions),
   }))
 
   for (let i = 0; i < notes.length; i++) {

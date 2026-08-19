@@ -1,12 +1,16 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import type { BlockNote, TxMix } from './chain.js'
+import type { BlockNote, TxMix, TxNote } from './chain.js'
 import { compose, degreeToMidi, midiToHz } from './music.js'
 import { characterOf, deriveStyle, MODES, type Style } from './style.js'
 import { encodeWav, render, SAMPLE_RATE, toMono } from './synth.js'
 
 const mix = (over: Partial<TxMix> = {}): TxMix => ({
   transfers: 60, tokenTransfers: 40, swaps: 6, creates: 0, blobs: 2, setCode: 0, other: 50, ...over,
+})
+
+const tx = (over: Partial<TxNote> = {}): TxNote => ({
+  kind: 'transfer', valueEth: 0.5, gasLimit: 21_000, position: 0.5, variant: 0.5, ...over,
 })
 
 function block(over: Partial<BlockNote> & { number: number }): BlockNote {
@@ -21,6 +25,11 @@ function block(over: Partial<BlockNote> & { number: number }): BlockNote {
     mixHash: '0x' + (over.number * 2654435761 >>> 0).toString(16).padStart(64, '0'),
     builderTag: 'testbuilder',
     tx: mix(),
+    notable: [
+      tx({ valueEth: 1 + (over.number % 5), position: 0.1, variant: (over.number % 10) / 10 }),
+      tx({ kind: 'token', valueEth: 0, gasLimit: 60_000, position: 0.4, variant: ((over.number * 3) % 10) / 10 }),
+      tx({ kind: 'swap', valueEth: 0, gasLimit: 180_000, position: 0.7, variant: ((over.number * 7) % 10) / 10 }),
+    ],
     ...over,
   }
 }
@@ -150,24 +159,23 @@ test('a surge reaches chords the calm never does', () => {
   assert.ok(surgeChords.size > calmChords.size)
 })
 
-test('drums drop out in the calm and the full kit arrives at the peak', () => {
+test('drums drop out in the calm and arrive at the peak', () => {
   const score = run(arc())
   const inSection = (ev: { at: number }) => score.sections.findIndex((s) => ev.at >= s.start && ev.at < s.end)
   const calmest = score.sections.reduce((a, s, i) => (s.intensity < score.sections[a]!.intensity ? i : a), 0)
   const peak = score.sections.reduce((a, s, i) => (s.intensity > score.sections[a]!.intensity ? i : a), 0)
   const hats = score.events.filter((e) => e.role === 'hat')
-  const arps = score.events.filter((e) => e.role === 'arp')
   assert.equal(hats.filter((e) => inSection(e) === calmest).length, 0)
   assert.ok(hats.filter((e) => inSection(e) === peak).length > 0)
-  assert.equal(arps.filter((e) => inSection(e) === calmest).length, 0)
-  assert.ok(arps.filter((e) => inSection(e) === peak).length > 0)
 })
 
-test('a contract deployment rings a bell', () => {
-  const blocks = arc(32, (i) => ({ tx: mix({ creates: i === 10 ? 2 : 0 }) }))
-  const bells = run(blocks).events.filter((e) => e.role === 'accent' && e.instrument === 'fm-bell')
-  assert.equal(bells.length, 1)
-  assert.equal(bells[0]?.blockNumber, 10)
+test('a contract deployment rings a bell on its own block', () => {
+  const blocks = arc(32, (i) => (i === 10
+    ? { notable: [tx({ kind: 'deploy', valueEth: 0, gasLimit: 900_000, position: 0.5, variant: 0.3 })] }
+    : { notable: [tx({ position: 0.5 })] }))
+  const bells = run(blocks).events.filter((e) => e.instrument === 'fm-bell')
+  assert.ok(bells.length >= 1)
+  assert.ok(bells.every((e) => e.blockNumber === 10))
 })
 
 test('swing pushes the off-beat subdivisions late', () => {
@@ -181,17 +189,69 @@ test('swing pushes the off-beat subdivisions late', () => {
   assert.ok(later > a.length * 0.3, 'a good share of hats should land later when swung')
 })
 
-test('the lead follows a motif and never leaps wildly', () => {
-  const leads = run(arc()).events.filter((e) => e.role === 'lead').map((e) => hzToMidi(e.frequency))
-  const minor = MODES.minor
-  const degreeOf = (midi: number) => {
-    const semis = midi - 69
-    return Math.floor(semis / 12) * 7 + minor.indexOf(((semis % 12) + 12) % 12)
+test('a whale transaction rings higher than a dust send', () => {
+  const mk = (valueEth: number) =>
+    Array.from({ length: 8 }, (_, i) => block({ number: i, notable: [tx({ valueEth, position: 0.2 })] }))
+  const leadPitch = (blocks: BlockNote[]) => {
+    const leads = run(blocks).events.filter((e) => e.role === 'lead')
+    return leads.reduce((s2, e) => s2 + e.frequency, 0) / leads.length
   }
-  for (let i = 1; i < leads.length; i++) {
-    assert.ok(Math.abs(degreeOf(leads[i] as number) - degreeOf(leads[i - 1] as number)) <= 5)
+  assert.ok(leadPitch(mk(200)) > leadPitch(mk(0.01)) * 1.5, 'value should set the register')
+})
+
+test('every foreground note is a transaction', () => {
+  const score = run(arc())
+  for (const e of score.events) {
+    if (e.role === 'lead' || e.role === 'tx') {
+      assert.ok(e.variant >= 0 && e.variant <= 1)
+    }
   }
-  assert.ok(leads.length < 96 && leads.length > 30, 'melody leaves space but carries')
+  const foreground = score.events.filter((e) => e.role === 'lead' || e.role === 'tx')
+  assert.ok(foreground.length > 100, 'the tx layer should carry the piece')
+})
+
+test('a transaction kind always speaks its own instrument family', () => {
+  // The arc gives the piece a surge; in the surge all three txs are audible.
+  // A flat range keeps only the two most salient, which is by design.
+  const blocks = arc(48, () => ({
+    notable: [
+      tx({ kind: 'swap', valueEth: 0, gasLimit: 200_000, position: 0.3 }),
+      tx({ kind: 'deploy', valueEth: 0, gasLimit: 900_000, position: 0.6 }),
+      tx({ kind: 'token', valueEth: 0, gasLimit: 60_000, position: 0.8 }),
+    ],
+  }))
+  // A deploy is important enough to take the lead slot, so look across both
+  // foreground roles: the vocabulary holds wherever the note sits.
+  const foreground = run(blocks).events.filter((e) => e.role === 'tx' || e.role === 'lead')
+  const instruments = new Set(foreground.map((e) => e.instrument))
+  assert.ok(foreground.some((e) => e.instrument === 'acid-bass'), 'swaps speak acid')
+  assert.ok(foreground.some((e) => e.instrument === 'fm-bell'), 'deploys ring the bell')
+  assert.ok(instruments.size >= 3, 'kinds must not collapse into one sound')
+})
+
+test('two transactions never render the identical sound', () => {
+  const mkScore = (variant: number) => ({
+    duration: 1.5,
+    style: FIXED,
+    sections: [],
+    events: [{ at: 0, length: 0.4, frequency: 440, velocity: 0.5, instrument: 'pluck' as const, role: 'tx' as const, pan: 0, colour: 0.5, variant, blockNumber: 1 }],
+  })
+  const a = render(mkScore(0.15))
+  const b = render(mkScore(0.85))
+  let diff = 0
+  for (let i = 0; i < a.left.length; i++) diff += Math.abs((a.left[i] as number) - (b.left[i] as number))
+  assert.ok(diff > 5, `different hashes must sound different (diff ${diff.toFixed(2)})`)
+})
+
+test('texture thins out when the chain is calm', () => {
+  const score = run(arc())
+  const inSection = (ev: { at: number }) => score.sections.findIndex((x) => ev.at >= x.start && ev.at < x.end)
+  const calmest = score.sections.reduce((a, x, i) => (x.intensity < score.sections[a]!.intensity ? i : a), 0)
+  const peak = score.sections.reduce((a, x, i) => (x.intensity > score.sections[a]!.intensity ? i : a), 0)
+  const txNotes = score.events.filter((e) => e.role === 'tx')
+  const calmCount = txNotes.filter((e) => inSection(e) === calmest).length
+  const peakCount = txNotes.filter((e) => inSection(e) === peak).length
+  assert.ok(peakCount > calmCount, `peak ${peakCount} should out-note calm ${calmCount}`)
 })
 
 test('a missed slot lengthens its section; an absurd gap is clamped to the same stretch', () => {
