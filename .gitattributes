@@ -1,0 +1,3 @@
+* text=auto eol=lf
+*.wav binary
+package-lock.json linguist-generated=true -diff
